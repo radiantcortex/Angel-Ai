@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(ls \"c:/Users/Lenovo/Desktop/New folder \\(3\\)\")",
-      "Bash(ls \"c:/Users/Lenovo/Desktop/New folder \\(3\\)/Azure-Angel-Frontend/src\")"
-    ]
-  }
-}
