@@ -1,0 +1,779 @@
+from db.supabase import supabase
+import logging
+import os
+import httpx
+from gotrue.errors import AuthApiError
+
+logger = logging.getLogger(__name__)
+
+
+def _check_user_exists(email: str) -> bool:
+    """
+    Check if a user with the given email already exists in auth.users table.
+    Uses a database function for efficient direct query - this is the ROOT CAUSE fix.
+    Prevents duplicate signups by checking BEFORE calling sign_up().
+    """
+    try:
+        # Use RPC to call database function that directly queries auth.users table
+        # This is the most efficient and reliable method
+        result = supabase.rpc('check_email_exists', {'email_address': email}).execute()
+        
+        if result.data is True:
+            logger.warning(f"User with email {email} already exists in database")
+            return True
+        return False
+        
+    except Exception as e:
+        # If RPC function doesn't exist yet, fall back to admin API
+        logger.warning(f"RPC function check_email_exists not available, using admin API fallback: {e}")
+        try:
+            # Fallback: Use admin API (less efficient but works)
+            email_lower = email.lower().strip()
+            users_response = supabase.auth.admin.list_users(page=1, per_page=1000)
+            
+            if hasattr(users_response, 'users') and users_response.users:
+                for user in users_response.users:
+                    if user.email and user.email.lower().strip() == email_lower:
+                        logger.warning(f"User with email {email} already exists in database")
+                        return True
+        except Exception as admin_error:
+            logger.error(f"Failed to check user existence via admin API: {admin_error}")
+            # FAIL SAFE: Don't allow signup if we can't verify - prevents duplicates
+            raise ValueError("Unable to verify email availability. Please try again later or contact support.") from admin_error
+    
+    return False
+
+
+def _get_user_by_email(email: str):
+    """
+    Get user by email from Supabase auth.users table using direct database query.
+    Uses RPC function for efficient O(1) lookup - works for any number of users.
+    Returns user-like object if found, None otherwise.
+    """
+    try:
+        # Primary method: Use RPC function that queries auth.users directly
+        # This is the most efficient approach - direct database query, no pagination needed
+        result = supabase.rpc('get_user_by_email', {'email_address': email}).execute()
+        
+        if result.data:
+            user_data = result.data
+            # Create a simple user-like object from the JSON response
+            class UserObject:
+                def __init__(self, data):
+                    self.id = data.get('id')
+                    self.email = data.get('email')
+                    self.email_confirmed_at = data.get('email_confirmed_at')
+                    self.created_at = data.get('created_at')
+                    self.updated_at = data.get('updated_at')
+                    self.user_metadata = data.get('user_metadata', {})
+                    self.app_metadata = data.get('app_metadata', {})
+            
+            logger.info(f"Found user with email {email} via RPC function")
+            return UserObject(user_data)
+        
+        logger.info(f"User with email {email} not found via RPC function")
+        return None
+        
+    except Exception as e:
+        # Fallback: If RPC function doesn't exist, use admin API
+        # This should rarely happen if SQL function is properly set up
+        logger.warning(f"RPC function get_user_by_email not available, using admin API fallback: {e}")
+        try:
+            # Fallback: Use admin API with get_user_by_id after finding user_id
+            # This is less efficient but works as backup
+            email_lower = email.lower().strip()
+            
+            # Try to get user using admin API's list_users with pagination
+            # But limit to first page only as fallback (not ideal, but better than nothing)
+            users_response = supabase.auth.admin.list_users(page=1, per_page=1000)
+            
+            if hasattr(users_response, 'users') and users_response.users:
+                for user in users_response.users:
+                    if user.email and user.email.lower().strip() == email_lower:
+                        logger.info(f"Found user with email {email} via admin API fallback")
+                        return user
+            
+            logger.warning(f"User with email {email} not found in admin API fallback")
+            return None
+            
+        except Exception as admin_error:
+            logger.error(f"Failed to get user by email via admin API fallback: {admin_error}")
+            return None
+
+
+def _require_user_id_by_email(email: str) -> str:
+    user = _get_user_by_email(email)
+    if not user or not getattr(user, "id", None):
+        raise ValueError("User not found for this email.")
+    return user.id
+
+
+async def create_user(email: str, password: str, full_name: str):
+    # Check if user already exists before attempting signup
+    if _check_user_exists(email):
+        raise ValueError("An account with this email already exists. Please sign in instead.")
+    user_data = {
+        "full_name": full_name,
+        "display_name": full_name,
+    }
+
+    try:
+        # Use admin API to create user WITHOUT sending confirmation email
+        # This prevents the automatic email from being sent
+        # We'll send it manually after Terms/Privacy acceptance
+        try:
+            # Create user via admin API (doesn't send email automatically)
+            admin_response = supabase.auth.admin.create_user({
+                "email": email,
+                "password": password,
+                "email_confirm": False,  # Don't confirm email yet
+                "user_metadata": user_data
+            })
+            
+            if admin_response.user is None:
+                raise ValueError("User not created")
+            
+            user_id = admin_response.user.id
+            response_user = admin_response.user
+            
+        except Exception as admin_error:
+            # Fallback to regular sign_up if admin API fails
+            logger.warning(f"Admin API user creation failed, using sign_up: {admin_error}")
+            response = supabase.auth.sign_up({
+                "email": email,
+                "password": password,
+                "options": {
+                    "data": user_data,
+                    "email_redirect_to": None
+                }
+            })
+            
+            if response.user is None:
+                raise ValueError("User not created")
+            
+            user_id = response.user.id
+            response_user = response.user
+    except AuthApiError as exc:
+        logger.error("Supabase signup failed: %s", exc.message)
+        # Check for duplicate email errors - provide user-friendly message
+        error_lower = exc.message.lower()
+        if any(keyword in error_lower for keyword in [
+            "already registered", 
+            "user already exists", 
+            "email already", 
+            "already been registered",
+            "user already registered",
+            "email address is already in use"
+        ]):
+            raise ValueError("An account with this email already exists. Please sign in instead.") from exc
+        # For other errors, return the original message
+        raise ValueError(exc.message) from exc
+    except Exception as exc:
+        logger.error(f"User creation failed: {exc}")
+        raise ValueError(f"Failed to create user: {str(exc)}") from exc
+
+    # user_id and response_user are set in the try block above
+
+    # Create acceptance record (both false initially)
+    try:
+        supabase.table("user_legal_acceptances").insert({
+            "user_id": user_id,
+            "terms_accepted": False,
+            "privacy_accepted": False,
+            "email_confirmation_sent": False
+        }).execute()
+        logger.info(f"Created legal acceptance record for user {user_id}")
+    except Exception as e:
+        logger.warning(f"Failed to create legal acceptance record: {e}")
+        # Don't fail signup if this fails, but log it
+
+    # Send confirmation email immediately after signup
+    # (Changed from waiting for Terms/Privacy acceptance since flow now shows those after login)
+    try:
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = frontend_url.rstrip('/')
+        redirect_url = f"{frontend_url}/auth/confirm"
+        
+        supabase_url = os.getenv("SUPABASE_URL")
+        service_role = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if supabase_url and service_role:
+            # Call GoTrue resend endpoint to send confirmation email
+            resp = httpx.post(
+                f"{supabase_url.rstrip('/')}/auth/v1/resend",
+                headers={
+                    "apikey": service_role,
+                    "Authorization": f"Bearer {service_role}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "type": "signup",
+                    "email": email,
+                    "options": {"email_redirect_to": redirect_url},
+                },
+                timeout=30.0,
+            )
+            if resp.status_code < 400:
+                # Mark email as sent
+                from datetime import datetime
+                try:
+                    supabase.table("user_legal_acceptances").update({
+                        "email_confirmation_sent": True,
+                        "email_confirmation_sent_at": datetime.now().isoformat()
+                    }).eq("user_id", user_id).execute()
+                    logger.info(f"Confirmation email sent to {email} immediately after signup")
+                except Exception as update_error:
+                    logger.warning(f"Failed to update email_confirmation_sent flag: {update_error}")
+            else:
+                logger.warning(f"Failed to send confirmation email: HTTP {resp.status_code} - {resp.text}")
+        else:
+            logger.warning("Supabase URL or service role key not configured - cannot send confirmation email")
+    except Exception as email_error:
+        # Don't fail signup if email sending fails - log it but continue
+        logger.warning(f"Failed to send confirmation email after signup: {email_error}")
+        # User can request resend later if needed
+
+    try:
+        updated_user_response = supabase.auth.admin.get_user_by_id(user_id)
+        return updated_user_response.user
+    except AuthApiError as exc:
+        logger.warning("Unable to fetch user after signup, returning created user: %s", exc.message)
+        return response_user
+
+async def authenticate_user(email: str, password: str):
+    """
+    Authenticate user with email and password.
+    Returns session if successful.
+    Raises descriptive error for email confirmation issues.
+    """
+    try:
+        response = supabase.auth.sign_in_with_password({"email": email, "password": password})
+        if response.session is None:
+            # Check if user exists but email is not confirmed
+            # Supabase returns None session for unconfirmed emails but doesn't always throw error
+            raise ValueError("Invalid credentials. If you just signed up, check your inbox for a validation link.")
+        return response.session
+    except AuthApiError as exc:
+        # Check for email confirmation errors
+        error_message = exc.message.lower()
+        
+        email_confirmation_keywords = [
+            "email not confirmed",
+            "email not verified", 
+            "email confirmation",
+            "email verify",
+            "unconfirmed email",
+            "email address not confirmed",
+            "user email not confirmed",
+            "email address is not confirmed",
+            "email not confirmed",
+            "email_confirmed",
+            "email address must be confirmed"
+        ]
+        
+        is_email_confirmation_error = any(keyword in error_message for keyword in email_confirmation_keywords)
+        
+        if is_email_confirmation_error:
+            raise ValueError("If you just signed up, check your inbox for a validation link. You must confirm your email address before you can sign in.") from exc
+        
+        # Check for invalid credentials - might be unconfirmed email
+        invalid_credential_keywords = [
+            "invalid login credentials",
+            "invalid credentials",
+            "email or password is incorrect",
+            "incorrect email or password"
+        ]
+        
+        if any(keyword in error_message for keyword in invalid_credential_keywords):
+            # Could be unconfirmed email - check if user exists and email confirmation status
+            try:
+                if _check_user_exists(email):
+                    # User exists - check if email is confirmed
+                    user = _get_user_by_email(email)
+                    if user:
+                        # Check email confirmation status
+                        email_confirmed = getattr(user, 'email_confirmed_at', None) is not None
+                        if not email_confirmed:
+                            raise ValueError("If you just signed up, check your inbox for a validation link. You must confirm your email address before you can sign in.")
+                        # Email is confirmed but password is wrong
+                        raise ValueError("Invalid password. Please check your password and try again.")
+            except ValueError:
+                # Re-raise ValueError (email confirmation or password error)
+                raise
+            except Exception:
+                pass  # If we can't check, just return generic error
+            
+            raise ValueError("Invalid email or password. Please check your credentials and try again.") from exc
+        
+        # Re-raise other errors
+        raise ValueError(exc.message) from exc
+    except ValueError:
+        # Re-raise ValueError errors (like the ones we just raised)
+        raise
+    except Exception as exc:
+        logger.error(f"Authentication failed: {exc}")
+        raise ValueError(f"Authentication failed: {str(exc)}") from exc
+
+async def send_reset_password_email(email: str):
+    """
+    Send password reset email to user.
+    Supabase handles sending the email using its SMTP + templates.
+    """
+    try:
+        user_obj = None
+        try:
+            if not _check_user_exists(email):
+                logger.warning(f"Password reset requested for non-existent email: {email}")
+                raise ValueError("This account is not available. Please check your email address.")
+            user_obj = _get_user_by_email(email)
+            if not user_obj:
+                logger.error(f"User exists in database but not found in admin API for email: {email}")
+                raise ValueError("User account found but unable to process reset. Please contact support.")
+        except ValueError:
+            raise
+        except Exception as check_err:
+            msg = str(check_err).lower()
+            if "jwt" in msg or "token" in msg or "expired" in msg or "unauthorized" in msg or "forbidden" in msg:
+                logger.warning(f"User existence check failed (likely Supabase credentials): {check_err}. Attempting reset send anyway.")
+                # Proceed to send - Supabase reset_password_for_email will send only if user exists
+            else:
+                raise ValueError("Unable to verify email availability. Please try again later or contact support.") from check_err
+        
+        if user_obj:
+            email_confirmed = getattr(user_obj, 'email_confirmed_at', None) is not None
+            if not email_confirmed:
+                logger.info(f"Password reset requested for unconfirmed email: {email} - will attempt to send anyway")
+        
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = frontend_url.rstrip('/')
+        redirect_url = f"{frontend_url}/reset-password"
+
+        # Use Supabase's standard reset_password_for_email method
+        # This creates a proper recovery link that Supabase's verify endpoint can process
+        # The redirect_to URL must be in Supabase's allowed redirect URLs list
+        try:
+            supabase.auth.reset_password_for_email(email, {"redirect_to": redirect_url})
+            logger.info(f"Password reset email triggered via Supabase for {email} (redirect_to: {redirect_url})")
+        except ValueError:
+            raise
+        except Exception as send_error:
+            error_str = str(send_error).lower()
+            
+            # Handle rate limiting - Supabase limits password reset requests to once per 60 seconds
+            if "429" in str(send_error) or "too many requests" in error_str or "after" in error_str and "seconds" in error_str:
+                # Extract wait time from error message if available
+                import re
+                wait_match = re.search(r'after (\d+) seconds?', error_str)
+                wait_time = wait_match.group(1) if wait_match else "60"
+                logger.warning(f"Password reset rate limited for {email}. Please wait {wait_time} seconds before requesting again.")
+                raise ValueError(f"Too many password reset requests. Please wait {wait_time} seconds before requesting again. Check your email inbox - you may have already received a reset link.") from send_error
+            
+            # Handle email confirmation errors
+            if "email" in error_str and ("not confirmed" in error_str or "unconfirmed" in error_str):
+                logger.warning(f"Password reset blocked for unconfirmed email: {email}")
+                raise ValueError("Please confirm your email address first. Check your inbox for the confirmation email, then try resetting your password again. If you didn't receive the confirmation email, please contact support.") from send_error
+            
+            # Handle JWT/credential errors - backend Supabase key may be wrong or expired
+            if "jwt" in error_str or "token" in error_str or "expired" in error_str or "401" in str(send_error) or "403" in str(send_error):
+                logger.error(f"Supabase credential error sending reset email: {send_error}")
+                raise ValueError(
+                    "Backend Supabase credentials are invalid or expired. "
+                    "Please verify SUPABASE_SERVICE_ROLE_KEY in .env matches Supabase Dashboard > Project Settings > API > service_role key."
+                ) from send_error
+
+            # Handle other errors
+            logger.error(f"Failed to send password reset email: {send_error}")
+            raise ValueError("Failed to send password reset email. Please check your Supabase email configuration (SMTP settings and email templates) or contact support.") from send_error
+        
+        return {
+            "email": email, 
+            "message": "A password reset link has been sent to your email. Please check your inbox (and spam folder). The link will expire in 1 hour."
+        }
+    except ValueError as e:
+        # Re-raise ValueError (user doesn't exist)
+        raise e
+    except AuthApiError as exc:
+        logger.error(f"Failed to send reset password email to {email}: {exc.message}")
+        raise ValueError("Failed to send reset password email. Please try again later.") from exc
+    except Exception as e:
+        logger.error(f"Unexpected error sending reset password email: {e}")
+        raise ValueError("Failed to send reset password email. Please try again later.") from e
+
+
+async def update_password(token: str, new_password: str):
+    """
+    Update user password using the recovery access_token from email.
+    The token is already validated by Supabase when user clicks the link.
+    We decode it to get user_id and update password via admin API.
+    """
+    try:
+        import base64
+        import json
+        from supabase import create_client
+        
+        # Decode the JWT access_token to extract user information
+        try:
+            token_parts = token.split('.')
+            if len(token_parts) != 3:
+                raise ValueError("Invalid token format")
+            
+            # Decode payload
+            payload = token_parts[1]
+            padding = len(payload) % 4
+            if padding:
+                payload += '=' * (4 - padding)
+            
+            decoded_payload = base64.urlsafe_b64decode(payload)
+            token_data = json.loads(decoded_payload)
+            
+            user_id = token_data.get('sub')  # User ID
+            email = token_data.get('email')
+            exp = token_data.get('exp')  # Expiration timestamp
+            
+            if not user_id:
+                raise ValueError("Token does not contain user information")
+            
+            # Check expiration
+            if exp:
+                from datetime import datetime, timezone, timedelta
+                exp_datetime = datetime.fromtimestamp(exp, tz=timezone.utc)
+                now = datetime.now(timezone.utc)
+                time_until_expiry = exp_datetime - now
+                time_until_expiry_seconds = time_until_expiry.total_seconds()
+                
+                # Log token expiration details for debugging
+                logger.info(f"Recovery token expiration check - Now: {now.isoformat()}, Expires: {exp_datetime.isoformat()}, Time until expiry: {time_until_expiry_seconds:.0f} seconds ({time_until_expiry_seconds/60:.1f} minutes)")
+                
+                # Add 5 second buffer to account for clock skew and processing time
+                if time_until_expiry_seconds < -5:
+                    logger.warning(f"Password reset token expired for user: {user_id}. Token expired {abs(time_until_expiry_seconds):.0f} seconds ago.")
+                    raise ValueError("Password reset link has expired. Please request a new password reset link.")
+                elif time_until_expiry_seconds < 60:
+                    logger.warning(f"Password reset token expiring soon for user: {user_id}. Only {time_until_expiry_seconds:.0f} seconds remaining.")
+            else:
+                logger.warning(f"Recovery token missing 'exp' claim - cannot verify expiration")
+            
+            logger.info(f"Decoded recovery token for user_id: {user_id}, email: {email}")
+            
+        except (ValueError, json.JSONDecodeError, Exception) as decode_error:
+            logger.error(f"Failed to decode recovery token: {decode_error}")
+            raise ValueError("Invalid reset token format. Please use the link from your email.") from decode_error
+        
+        # Use the recovery token to create a user session and update password
+        # The token is an access_token that's already validated by Supabase
+        # We need to create a user client (not admin) and use the token to authenticate
+        try:
+            from db.supabase import SUPABASE_URL
+            import os
+            
+            # Get anon key for user client (fallback to service role if not available)
+            anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+            if not anon_key:
+                raise ValueError("Supabase anon key not configured")
+            
+            # Create a user client (not admin client)
+            user_client = create_client(SUPABASE_URL, anon_key)
+            
+            # Set the session using the access_token from recovery link
+            # The token is already validated, we just need to use it to authenticate
+            try:
+                # Use the token to get user info and set session
+                # We'll use the token directly in the Authorization header
+                # First, let's try to update password using the token as bearer token
+                import httpx
+                
+                # Make direct API call with the token
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "apikey": anon_key,
+                    "Content-Type": "application/json"
+                }
+                
+                update_data = {"password": new_password}
+                response = httpx.put(
+                    f"{SUPABASE_URL}/auth/v1/user",
+                    headers=headers,
+                    json=update_data,
+                    timeout=30.0
+                )
+                
+                if response.status_code == 200:
+                    user_data = response.json()
+                    logger.info(f"Password updated successfully for user: {user_data.get('email', email)}")
+                    return {
+                        "success": True,
+                        "message": "Password updated successfully",
+                        "user": {
+                            "id": user_data.get("id", user_id),
+                            "email": user_data.get("email", email)
+                        }
+                    }
+                elif response.status_code == 401 or response.status_code == 403:
+                    raise ValueError("Invalid or expired reset token. Please request a new password reset link.")
+                else:
+                    error_msg = response.text or f"HTTP {response.status_code}"
+                    raise ValueError(f"Failed to update password: {error_msg}")
+                    
+            except httpx.HTTPError as http_error:
+                logger.error(f"HTTP error updating password: {http_error}")
+                raise ValueError("Failed to update password. Please try again later.") from http_error
+            except ValueError:
+                raise
+            except Exception as token_error:
+                logger.error(f"Error using token to update password: {token_error}")
+                # Fallback: Try admin API as last resort
+                try:
+                    update_response = supabase.auth.admin.update_user_by_id(
+                        user_id,
+                        {"password": new_password}
+                    )
+                    if update_response.user:
+                        logger.info(f"Password updated successfully via admin API for user: {update_response.user.email}")
+                        return {
+                            "success": True,
+                            "message": "Password updated successfully",
+                            "user": {
+                                "id": update_response.user.id,
+                                "email": update_response.user.email
+                            }
+                        }
+                except Exception as admin_fallback_error:
+                    logger.error(f"Admin API fallback also failed: {admin_fallback_error}")
+                    raise ValueError("Invalid or expired reset token. Please request a new password reset link.") from token_error
+                raise ValueError("Invalid or expired reset token. Please request a new password reset link.") from token_error
+                
+        except AuthApiError as auth_error:
+            logger.error(f"Auth API error updating password: {auth_error.message}")
+            error_lower = auth_error.message.lower()
+            if "expired" in error_lower or "invalid" in error_lower or "token" in error_lower:
+                raise ValueError("Invalid or expired reset token. Please request a new password reset link.") from auth_error
+            raise ValueError(f"Failed to update password: {auth_error.message}") from auth_error
+        
+    except ValueError as e:
+        # Re-raise ValueError errors (already formatted)
+        raise e
+    except AuthApiError as exc:
+        logger.error(f"Failed to update password: {exc.message}")
+        error_lower = exc.message.lower()
+        if "expired" in error_lower or "invalid" in error_lower or "token" in error_lower:
+            raise ValueError("Invalid or expired reset token. Please request a new password reset link.") from exc
+        raise ValueError(f"Failed to update password: {exc.message}") from exc
+    except Exception as e:
+        logger.error(f"Unexpected error updating password: {e}")
+        error_str = str(e).lower()
+        if "expired" in error_str:
+            raise ValueError("Password reset link has expired. Please request a new password reset link.") from e
+        raise ValueError("Failed to update password. Please try again later.") from e
+
+def refresh_session(refresh_token: str):
+    try:
+        logger.info("Attempting to refresh session with token")
+        response = supabase.auth.refresh_session(refresh_token)
+        if response.session is None:
+            logger.error("Token refresh failed - no session returned")
+            raise Exception("Token refresh failed")
+        logger.info("Session refreshed successfully")
+        return response.session
+    except Exception as e:
+        error_message = str(e)
+        logger.error(f"Error refreshing session: {error_message}")
+        
+        # Handle specific Supabase auth errors
+        if "Already Used" in error_message:
+            logger.warning("Refresh token already used - user needs to re-authenticate")
+            raise Exception("Session expired - please log in again")
+        elif "Invalid Refresh Token" in error_message:
+            logger.warning("Invalid refresh token - user needs to re-authenticate")
+            raise Exception("Session expired - please log in again")
+        else:
+            raise Exception(f"Token refresh failed: {error_message}")
+
+
+async def accept_terms(user_id: str, name: str, date: str):
+    """
+    Record user's acceptance of Terms and Conditions.
+    Returns True if both Terms and Privacy are now accepted.
+    """
+    try:
+        from datetime import datetime
+        
+        # Parse date string (expecting YYYY-MM-DD format)
+        acceptance_date = datetime.strptime(date, "%Y-%m-%d").date()
+        acceptance_timestamp = datetime.now()
+        
+        # Update or insert acceptance record
+        result = supabase.table("user_legal_acceptances").upsert({
+            "user_id": user_id,
+            "terms_accepted": True,
+            "terms_accepted_at": acceptance_timestamp.isoformat(),
+            "terms_accepted_name": name,
+            "terms_accepted_date": acceptance_date.isoformat()
+        }, on_conflict="user_id").execute()
+        
+        logger.info(f"Terms accepted by user {user_id}")
+        
+        # Check if both are now accepted
+        acceptance_record = supabase.table("user_legal_acceptances").select("*").eq("user_id", user_id).single().execute()
+        
+        if acceptance_record.data:
+            record = acceptance_record.data
+            both_accepted = record.get("terms_accepted", False) and record.get("privacy_accepted", False)
+            return both_accepted
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to record terms acceptance: {e}")
+        raise ValueError(f"Failed to record acceptance: {str(e)}") from e
+
+
+async def accept_privacy(user_id: str, name: str, date: str):
+    """
+    Record user's acceptance of Privacy Policy.
+    Returns True if both Terms and Privacy are now accepted.
+    """
+    try:
+        from datetime import datetime
+        
+        # Parse date string (expecting YYYY-MM-DD format)
+        acceptance_date = datetime.strptime(date, "%Y-%m-%d").date()
+        acceptance_timestamp = datetime.now()
+        
+        # Update or insert acceptance record
+        result = supabase.table("user_legal_acceptances").upsert({
+            "user_id": user_id,
+            "privacy_accepted": True,
+            "privacy_accepted_at": acceptance_timestamp.isoformat(),
+            "privacy_accepted_name": name,
+            "privacy_accepted_date": acceptance_date.isoformat()
+        }, on_conflict="user_id").execute()
+        
+        logger.info(f"Privacy Policy accepted by user {user_id}")
+        
+        # Check if both are now accepted
+        acceptance_record = supabase.table("user_legal_acceptances").select("*").eq("user_id", user_id).single().execute()
+        
+        if acceptance_record.data:
+            record = acceptance_record.data
+            both_accepted = record.get("terms_accepted", False) and record.get("privacy_accepted", False)
+            return both_accepted
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to record privacy acceptance: {e}")
+        raise ValueError(f"Failed to record acceptance: {str(e)}") from e
+
+
+async def send_confirmation_email_after_acceptance(user_id: str):
+    """
+    Send confirmation email after both Terms and Privacy are accepted.
+    This should only be called once both are accepted.
+    Uses Supabase admin API to generate confirmation link and send email.
+    
+    NOTE: Email sender configuration (support@founderport.ai) and "No Reply" setting
+    must be configured in Supabase Dashboard under:
+    - Authentication > Email Templates > Confirm signup
+    - Set sender email to: support@founderport.ai
+    - Add "No Reply" to subject line or email body
+    """
+    try:
+        # Get user email
+        user_response = supabase.auth.admin.get_user_by_id(user_id)
+        if not user_response or not user_response.user:
+            raise ValueError("User not found")
+        
+        user = user_response.user
+        email = user.email
+        
+        if not email:
+            raise ValueError("User email not found")
+        
+        # Check if email already sent
+        acceptance_record = supabase.table("user_legal_acceptances").select("*").eq("user_id", user_id).single().execute()
+        
+        if acceptance_record.data and acceptance_record.data.get("email_confirmation_sent", False):
+            logger.info(f"Confirmation email already sent to {email}")
+            return {"email": email, "message": "Confirmation email already sent"}
+        
+        # Trigger Supabase to send the confirmation email using its templates/SMTP
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = frontend_url.rstrip('/')
+        redirect_url = f"{frontend_url}/auth/confirm"
+
+        supabase_url = os.getenv("SUPABASE_URL")
+        service_role = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+        if not supabase_url or not service_role:
+            raise ValueError("Supabase is not configured. Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.")
+
+        try:
+            # Call GoTrue resend endpoint directly (supabase-py doesn't expose this reliably across versions)
+            # Docs: POST /auth/v1/resend with { type: "signup", email, options: { email_redirect_to } }
+            resp = httpx.post(
+                f"{supabase_url.rstrip('/')}/auth/v1/resend",
+                headers={
+                    "apikey": service_role,
+                    "Authorization": f"Bearer {service_role}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "type": "signup",
+                    "email": email,
+                    "options": {"email_redirect_to": redirect_url},
+                },
+                timeout=30.0,
+            )
+            if resp.status_code >= 400:
+                raise ValueError(resp.text or f"HTTP {resp.status_code}")
+        except ValueError:
+            raise
+        except Exception as send_error:
+            raise ValueError(f"Failed to trigger confirmation email via Supabase: {send_error}") from send_error
+        
+        # Mark email as sent
+        from datetime import datetime
+        supabase.table("user_legal_acceptances").update({
+            "email_confirmation_sent": True,
+            "email_confirmation_sent_at": datetime.now().isoformat()
+        }).eq("user_id", user_id).execute()
+        
+        logger.info(f"Confirmation email sent to {email}")
+        return {"email": email, "message": "Confirmation email sent successfully"}
+        
+    except Exception as e:
+        logger.error(f"Failed to send confirmation email: {e}")
+        raise ValueError(f"Failed to send confirmation email: {str(e)}") from e
+
+
+async def check_acceptance_status(user_id: str):
+    """
+    Check if user has accepted both Terms and Privacy Policy.
+    Returns dict with acceptance status.
+    """
+    try:
+        result = supabase.table("user_legal_acceptances").select("*").eq("user_id", user_id).single().execute()
+        
+        if not result.data:
+            return {
+                "terms_accepted": False,
+                "privacy_accepted": False,
+                "both_accepted": False
+            }
+        
+        record = result.data
+        terms_accepted = record.get("terms_accepted", False)
+        privacy_accepted = record.get("privacy_accepted", False)
+        
+        return {
+            "terms_accepted": terms_accepted,
+            "privacy_accepted": privacy_accepted,
+            "both_accepted": terms_accepted and privacy_accepted
+        }
+        
+    except Exception as e:
+        logger.warning(f"Failed to check acceptance status: {e}")
+        # Return false if we can't check (safer to block access)
+        return {
+            "terms_accepted": False,
+            "privacy_accepted": False,
+            "both_accepted": False
+        }

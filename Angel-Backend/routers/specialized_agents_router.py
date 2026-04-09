@@ -1,0 +1,697 @@
+from fastapi import APIRouter, Request, Depends, HTTPException
+from typing import Dict, List, Any, Optional
+from services.specialized_agents_service import agents_manager, get_comprehensive_guidance
+from services.rag_service import conduct_rag_research, validate_with_rag, generate_rag_insights, research_service_providers_rag
+from services.service_provider_tables_service import generate_provider_table, get_task_providers
+from middlewares.auth import verify_auth_token
+from schemas.angel_schemas import ChatRequestSchema
+from datetime import datetime, timedelta
+import hashlib
+import json
+
+router = APIRouter(
+    tags=["Specialized Agents & RAG"],
+    dependencies=[Depends(verify_auth_token)]
+)
+
+CACHE_TTL = timedelta(hours=6)
+_cache_store: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
+def _serialize_for_cache(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _get_cache(bucket: str, key: str) -> Optional[Any]:
+    bucket_store = _cache_store.get(bucket)
+    if not bucket_store:
+        return None
+    entry = bucket_store.get(key)
+    if not entry:
+        return None
+    if entry["expires_at"] < datetime.utcnow():
+        bucket_store.pop(key, None)
+        return None
+    return entry["data"]
+
+
+def _set_cache(bucket: str, key: str, data: Any) -> None:
+    bucket_store = _cache_store.setdefault(bucket, {})
+    bucket_store[key] = {
+        "data": data,
+        "expires_at": datetime.utcnow() + CACHE_TTL
+    }
+
+
+def _make_cache_key(*parts: Any) -> str:
+    raw = "||".join(_serialize_for_cache(part) for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+@router.post("/agent-guidance")
+async def get_agent_guidance(
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Get guidance from specialized agents"""
+    
+    user_id = request.state.user["id"]
+    question = payload.get("question", "")
+    agent_type = payload.get("agent_type", "comprehensive")  # or specific agent type
+    business_context = payload.get("business_context", {})
+    
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+    
+    normalized_question = question.strip()
+    cache_key = _make_cache_key(user_id, agent_type, normalized_question, business_context)
+    cached_response = _get_cache("agent_guidance", cache_key)
+    if cached_response:
+        print(f"📦 Using cached agent guidance for agent={agent_type}")
+        return cached_response
+
+    try:
+        # Check if this is during implementation phase startup - skip web searches for speed
+        skip_web_search = payload.get("skip_web_search", False)
+        # Also skip if question is about implementation/roadmap tasks (common during startup)
+        if not skip_web_search:
+            question_lower = normalized_question.lower()
+            implementation_keywords = ["implementation", "roadmap", "task", "start", "begin", "next step"]
+            skip_web_search = any(keyword in question_lower for keyword in implementation_keywords)
+        
+        response_payload = None
+        if agent_type == "comprehensive":
+            # Get guidance from all relevant agents
+            guidance = await get_comprehensive_guidance(normalized_question, business_context, [], skip_web_search=skip_web_search)
+        else:
+            # Get guidance from specific agent
+            guidance = await agents_manager.get_agent_guidance(agent_type, normalized_question, business_context, [], skip_web_search=skip_web_search)
+        
+        response_payload = {
+            "success": True,
+            "message": "Agent guidance generated successfully",
+            "result": guidance
+        }
+        _set_cache("agent_guidance", cache_key, response_payload)
+        return response_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get agent guidance: {str(e)}")
+
+@router.post("/provider-table")
+async def get_provider_table(
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Get service provider table for specific task"""
+    
+    user_id = request.state.user["id"]
+    task_id = payload.get("task_id", "")
+    business_context = payload.get("business_context", {})
+    
+    if not task_id:
+        raise HTTPException(status_code=400, detail="Task ID is required")
+    
+    cache_key = _make_cache_key(user_id, task_id, business_context)
+    cached_response = _get_cache("provider_table", cache_key)
+    if cached_response:
+        print(f"📦 Using cached provider table for task_id={task_id}")
+        return cached_response
+
+    try:
+        response_payload = None
+        # Create task description from task_id
+        task_description = f"implementation task {task_id}"
+        providers = await get_task_providers(task_id, task_description, business_context)
+        
+        response_payload = {
+            "success": True,
+            "message": "Provider table generated successfully",
+            "result": {
+                "providers": providers,
+                "task_id": task_id
+            }
+        }
+        _set_cache("provider_table", cache_key, response_payload)
+        return response_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get provider table: {str(e)}")
+
+@router.post("/get-agents")
+async def get_agents_for_task(request: Request):
+    """Get specialized agents relevant to the current task and business context"""
+    
+    try:
+        payload = await request.json()
+        task_context = payload.get("task_context", "")
+        business_context = payload.get("business_context", {})
+        
+        agent_info = agents_manager.get_agent_info()
+        
+        # Convert dictionary to array format expected by frontend
+        agents_array = []
+        for agent_type, info in agent_info.items():
+            # Filter agents based on task context if provided
+            is_relevant = True
+            if task_context:
+                task_lower = task_context.lower()
+                agent_name_lower = info["name"].lower()
+                expertise_lower = info.get("expertise", "").lower()
+                
+                # Check if agent is relevant to task
+                relevant_keywords = {
+                    "legal": ["legal", "law", "compliance", "regulation", "contract"],
+                    "financial": ["financial", "accounting", "tax", "bookkeeping", "finance"],
+                    "marketing": ["marketing", "advertising", "promotion", "brand", "sales"],
+                    "operations": ["operations", "logistics", "supply", "inventory", "process"],
+                    "technology": ["technology", "software", "it", "tech", "digital"]
+                }
+                
+                # Simple relevance check
+                is_relevant = any(
+                    keyword in task_lower and keyword in (agent_name_lower + " " + expertise_lower)
+                    for keywords in relevant_keywords.values()
+                    for keyword in keywords
+                ) or not task_context  # If no task context, show all agents
+            
+            if is_relevant:
+                agents_array.append({
+                    "id": agent_type,
+                    "agent_type": agent_type,
+                    "name": info["name"],
+                    "description": f"Specialized agent for {agent_type.replace('_', ' ')}",
+                    "expertise": info.get("expertise", ""),
+                    "icon": info.get("icon", "Users"),
+                    "color": info.get("color", "bg-gray-100")
+                })
+        
+        return {
+            "success": True,
+            "message": "Available agents retrieved successfully",
+            "result": {
+                "agents": agents_array,
+                "total_agents": len(agents_array)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get agents: {str(e)}")
+
+@router.get("/agents")
+async def get_agents(request: Request):
+    """Get information about available specialized agents"""
+    
+    try:
+        agent_info = agents_manager.get_agent_info()
+        
+        # Convert dictionary to array format expected by frontend
+        agents_array = []
+        for agent_type, info in agent_info.items():
+            agents_array.append({
+                "id": agent_type,
+                "agent_type": agent_type,
+                "name": info["name"],
+                "description": f"Specialized agent for {agent_type.replace('_', ' ')}",
+                "capabilities": ["guidance", "research", "recommendations"],
+                "expertise_areas": [agent_type],
+                "expertise": info["expertise"],
+                "research_sources": info["research_sources"]
+            })
+        
+        return {
+            "success": True,
+            "message": "Available agents retrieved successfully",
+            "result": {
+                "agents": agents_array,
+                "total_agents": len(agents_array)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get agent info: {str(e)}")
+
+@router.post("/rag-research")
+async def conduct_rag_research_simple(
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Conduct RAG research without session ID"""
+    
+    user_id = request.state.user["id"]
+    query = payload.get("query", "")
+    business_context = payload.get("business_context", {})
+    
+    if not query:
+        raise HTTPException(status_code=400, detail="Research query is required")
+    
+    cache_key = _make_cache_key(user_id, query, business_context, "standard")
+    cached_response = _get_cache("rag_research", cache_key)
+    if cached_response:
+        print(f"📦 Using cached RAG research (simple) for query={query[:40]}")
+        return cached_response
+
+    try:
+        research_results = await conduct_rag_research(query, business_context, "standard")
+        
+        response_payload = {
+            "success": True,
+            "message": "RAG research completed successfully",
+            "result": research_results
+        }
+        _set_cache("rag_research", cache_key, response_payload)
+        return response_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to conduct RAG research: {str(e)}")
+
+@router.post("/interactive-command")
+async def handle_interactive_command_simple(
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Handle interactive commands without session ID"""
+    
+    user_id = request.state.user["id"]
+    command = payload.get("command", "").lower()
+    context = payload.get("context", "")
+    business_context = payload.get("business_context", {})
+    
+    if not command:
+        raise HTTPException(status_code=400, detail="Command is required")
+    
+    try:
+        response = {}
+        
+        if command == "help":
+            help_guidance = await get_comprehensive_guidance(
+                f"Provide detailed help for: {context}",
+                business_context,
+                []
+            )
+            response = {
+                "command": "help",
+                "guidance": help_guidance,
+                "type": "comprehensive_guidance"
+            }
+        else:
+            response = {
+                "command": command,
+                "message": f"Command '{command}' processed",
+                "type": "command_processed"
+            }
+        
+        return {
+            "success": True,
+            "message": f"Command '{command}' processed successfully",
+            "result": response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process command: {str(e)}")
+
+@router.get("/sessions/{session_id}/agents")
+async def get_available_agents(session_id: str, request: Request):
+    """Get information about available specialized agents"""
+    
+    try:
+        agent_info = agents_manager.get_agent_info()
+        
+        return {
+            "success": True,
+            "message": "Available agents retrieved successfully",
+            "result": {
+                "agents": agent_info,
+                "total_agents": len(agent_info)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get agent info: {str(e)}")
+
+@router.post("/sessions/{session_id}/rag-research")
+async def conduct_rag_research_endpoint(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Conduct comprehensive RAG research"""
+    
+    user_id = request.state.user["id"]
+    query = payload.get("query", "")
+    business_context = payload.get("business_context", {})
+    research_depth = payload.get("research_depth", "standard")  # basic, standard, comprehensive
+    
+    if not query:
+        raise HTTPException(status_code=400, detail="Research query is required")
+    
+    cache_key = _make_cache_key(session_id, user_id, query, business_context, research_depth)
+    cached_response = _get_cache("rag_research_session", cache_key)
+    if cached_response:
+        print(f"📦 Using cached session RAG research for query={query[:40]}")
+        return cached_response
+
+    try:
+        research_results = await conduct_rag_research(query, business_context, research_depth)
+        
+        response_payload = {
+            "success": True,
+            "message": "RAG research completed successfully",
+            "result": research_results
+        }
+        _set_cache("rag_research_session", cache_key, response_payload)
+        return response_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to conduct RAG research: {str(e)}")
+
+@router.post("/sessions/{session_id}/rag-validation")
+async def validate_user_input_rag(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Validate user input using RAG research"""
+    
+    user_id = request.state.user["id"]
+    user_input = payload.get("user_input", "")
+    question_type = payload.get("question_type", "general")
+    business_context = payload.get("business_context", {})
+    
+    if not user_input:
+        raise HTTPException(status_code=400, detail="User input is required")
+    
+    try:
+        validation_results = await validate_with_rag(user_input, business_context, question_type)
+        
+        return {
+            "success": True,
+            "message": "Input validation completed successfully",
+            "result": validation_results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to validate input: {str(e)}")
+
+@router.post("/sessions/{session_id}/rag-insights")
+async def generate_educational_insights_rag(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Generate educational insights using RAG"""
+    
+    user_id = request.state.user["id"]
+    user_response = payload.get("user_response", "")
+    question_context = payload.get("question_context", "")
+    business_context = payload.get("business_context", {})
+    
+    if not user_response or not question_context:
+        raise HTTPException(status_code=400, detail="User response and question context are required")
+    
+    try:
+        insights = await generate_rag_insights(user_response, question_context, business_context)
+        
+        return {
+            "success": True,
+            "message": "Educational insights generated successfully",
+            "result": {
+                "insights": insights,
+                "timestamp": request.state.timestamp if hasattr(request.state, 'timestamp') else None
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate insights: {str(e)}")
+
+@router.post("/sessions/{session_id}/service-providers")
+async def get_service_providers(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Get service providers using RAG research"""
+    
+    user_id = request.state.user["id"]
+    service_type = payload.get("service_type", "")
+    business_context = payload.get("business_context", {})
+    location = payload.get("location", None)
+    
+    if not service_type:
+        raise HTTPException(status_code=400, detail="Service type is required")
+    
+    try:
+        providers = await research_service_providers_rag(service_type, business_context, location)
+        
+        return {
+            "success": True,
+            "message": "Service providers retrieved successfully",
+            "result": providers
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get service providers: {str(e)}")
+
+@router.post("/sessions/{session_id}/provider-table")
+async def generate_service_provider_table_endpoint(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Generate comprehensive service provider table"""
+    
+    user_id = request.state.user["id"]
+    task_context = payload.get("task_context", "")
+    business_context = payload.get("business_context", {})
+    location = payload.get("location", None)
+    
+    if not task_context:
+        raise HTTPException(status_code=400, detail="Task context is required")
+    
+    cache_key = _make_cache_key(session_id, task_context, business_context, location)
+    cached_response = _get_cache("provider_table_session", cache_key)
+    if cached_response:
+        print(f"📦 Using cached session provider table for task_context={task_context[:40]}")
+        return cached_response
+
+    try:
+        provider_table = await generate_provider_table(task_context, business_context, location)
+        
+        response_payload = {
+            "success": True,
+            "message": "Service provider table generated successfully",
+            "result": provider_table
+        }
+        _set_cache("provider_table_session", cache_key, response_payload)
+        return response_payload
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate provider table: {str(e)}")
+
+@router.post("/sessions/{session_id}/task-providers")
+async def get_task_specific_providers(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Get providers for a specific implementation task"""
+    
+    user_id = request.state.user["id"]
+    task_id = payload.get("task_id", "")
+    task_description = payload.get("task_description", "")
+    business_context = payload.get("business_context", {})
+    location = payload.get("location", None)
+    
+    if not task_id or not task_description:
+        raise HTTPException(status_code=400, detail="Task ID and description are required")
+    
+    try:
+        task_providers = await get_task_providers(task_id, task_description, business_context, location)
+        
+        return {
+            "success": True,
+            "message": "Task-specific providers retrieved successfully",
+            "result": task_providers
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get task providers: {str(e)}")
+
+@router.post("/sessions/{session_id}/comprehensive-support")
+async def get_comprehensive_support(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Get comprehensive support combining agents, RAG, and service providers"""
+    
+    user_id = request.state.user["id"]
+    question = payload.get("question", "")
+    task_context = payload.get("task_context", "")
+    business_context = payload.get("business_context", {})
+    location = payload.get("location", None)
+    
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+    
+    try:
+        # Get agent guidance
+        agent_guidance = await get_comprehensive_guidance(question, business_context, [])
+        
+        # Conduct RAG research
+        rag_research = await conduct_rag_research(question, business_context, "standard")
+        
+        # Generate service provider table if task context provided
+        provider_table = None
+        if task_context:
+            provider_table = await generate_provider_table(task_context, business_context, location)
+        
+        # Combine all results
+        comprehensive_support = {
+            "question": question,
+            "task_context": task_context,
+            "business_context": business_context,
+            "agent_guidance": agent_guidance,
+            "rag_research": rag_research,
+            "provider_table": provider_table,
+            "timestamp": request.state.timestamp if hasattr(request.state, 'timestamp') else None
+        }
+        
+        return {
+            "success": True,
+            "message": "Comprehensive support generated successfully",
+            "result": comprehensive_support
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate comprehensive support: {str(e)}")
+
+@router.get("/sessions/{session_id}/research-sources")
+async def get_research_sources(session_id: str, request: Request):
+    """Get information about research sources used by RAG"""
+    
+    try:
+        from services.rag_service import rag_engine
+        
+        research_sources = {
+            "authoritative_sources": rag_engine.authoritative_sources,
+            "total_categories": len(rag_engine.authoritative_sources),
+            "total_sources": sum(len(sources) for sources in rag_engine.authoritative_sources.values())
+        }
+        
+        return {
+            "success": True,
+            "message": "Research sources retrieved successfully",
+            "result": research_sources
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get research sources: {str(e)}")
+
+@router.post("/sessions/{session_id}/interactive-command")
+async def handle_interactive_command(
+    session_id: str,
+    request: Request,
+    payload: Dict[str, Any]
+):
+    """Handle interactive commands with specialized support"""
+    
+    user_id = request.state.user["id"]
+    command = payload.get("command", "").lower()
+    context = payload.get("context", "")
+    business_context = payload.get("business_context", {})
+    
+    if not command:
+        raise HTTPException(status_code=400, detail="Command is required")
+    
+    try:
+        response = {}
+        
+        if command == "help":
+            # Get comprehensive help using agents
+            help_guidance = await get_comprehensive_guidance(
+                f"Provide detailed help for: {context}",
+                business_context,
+                []
+            )
+            response = {
+                "command": "help",
+                "guidance": help_guidance,
+                "type": "comprehensive_guidance"
+            }
+        
+        elif command == "who do i contact?":
+            # Get service provider recommendations
+            if context:
+                providers = await research_service_providers_rag(context, business_context)
+                response = {
+                    "command": "contact",
+                    "providers": providers,
+                    "type": "service_providers"
+                }
+            else:
+                response = {
+                    "command": "contact",
+                    "message": "Please specify what type of service you need help with",
+                    "type": "clarification_needed"
+                }
+        
+        elif command == "scrapping":
+            # Get refined guidance using RAG
+            if context:
+                insights = await generate_rag_insights(context, "idea refinement", business_context)
+                response = {
+                    "command": "scrapping",
+                    "refined_insights": insights,
+                    "type": "refined_guidance"
+                }
+            else:
+                response = {
+                    "command": "scrapping",
+                    "message": "Please provide the ideas you'd like me to help refine",
+                    "type": "clarification_needed"
+                }
+        
+        elif command == "draft":
+            # Generate draft using agents and RAG
+            if context:
+                draft_guidance = await get_comprehensive_guidance(
+                    f"Create a comprehensive draft for: {context}",
+                    business_context,
+                    []
+                )
+                response = {
+                    "command": "draft",
+                    "draft_content": draft_guidance,
+                    "type": "draft_content"
+                }
+            else:
+                response = {
+                    "command": "draft",
+                    "message": "Please specify what you'd like me to draft",
+                    "type": "clarification_needed"
+                }
+        
+        elif command == "kickstart":
+            # Generate kickstart plan with providers
+            if context:
+                kickstart_guidance = await get_comprehensive_guidance(
+                    f"Create a kickstart plan for: {context}",
+                    business_context,
+                    []
+                )
+                provider_table = await generate_provider_table(context, business_context)
+                response = {
+                    "command": "kickstart",
+                    "kickstart_plan": kickstart_guidance,
+                    "provider_table": provider_table,
+                    "type": "kickstart_plan"
+                }
+            else:
+                response = {
+                    "command": "kickstart",
+                    "message": "Please specify what you'd like me to help kickstart",
+                    "type": "clarification_needed"
+                }
+        
+        else:
+            response = {
+                "command": command,
+                "message": f"Unknown command: {command}. Available commands: help, who do i contact?, scrapping, draft, kickstart",
+                "type": "unknown_command"
+            }
+        
+        return {
+            "success": True,
+            "message": f"Command '{command}' processed successfully",
+            "result": response
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process command: {str(e)}")
